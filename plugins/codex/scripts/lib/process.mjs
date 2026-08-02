@@ -66,7 +66,8 @@ export function terminateProcessTree(pid, options = {}) {
   if (platform === "win32") {
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
-      env: options.env
+      env: options.env,
+      shell: false
     });
 
     if (!result.error && result.status === 0) {
@@ -76,6 +77,19 @@ export function terminateProcessTree(pid, options = {}) {
     const combinedOutput = `${result.stderr}\n${result.stdout}`.trim();
     if (!result.error && looksLikeMissingProcessMessage(combinedOutput)) {
       return { attempted: true, delivered: false, method: "taskkill", result };
+    }
+
+    if (!result.error) {
+      try {
+        killImpl(pid, 0);
+      } catch (error) {
+        if (error?.code === "ESRCH") {
+          return { attempted: true, delivered: true, method: "taskkill", result };
+        }
+        if (error?.code !== "EPERM") {
+          throw error;
+        }
+      }
     }
 
     if (result.error?.code === "ENOENT") {

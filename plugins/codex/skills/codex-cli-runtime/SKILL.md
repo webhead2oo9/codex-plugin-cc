@@ -1,6 +1,6 @@
 ---
 name: codex-cli-runtime
-description: Internal helper contract for calling the codex-companion runtime from Claude Code
+description: Internal monitored-job contract for calling the Codex companion runtime from Claude Code
 user-invocable: false
 ---
 
@@ -8,36 +8,42 @@ user-invocable: false
 
 Use this skill only inside the `codex:codex-rescue` subagent.
 
-Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
+Helpers:
+- Launch: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --background --json [task options] "<prompt>"`
+- Wait: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status <job-id> --wait --timeout-ms 90000 --json`
+- Result: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" result <job-id>`
 
-Execution rules:
-- The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
-- Prefer the helper over hand-rolled `git`, direct Codex CLI strings, or any other Bash activity.
-- Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel` from `codex:codex-rescue`.
-- Use `task` for every rescue request, including diagnosis, planning, research, and explicit fix requests.
-- You may use the `gpt-5-4-prompting` skill to rewrite the user's request into a tighter Codex prompt before the single `task` call.
-- That prompt drafting is the only Claude-side work allowed. Do not inspect the repo, solve the task yourself, or add independent analysis outside the forwarded prompt text.
-- Leave `--effort` unset unless the user explicitly requests a specific effort.
-- Leave model unset by default. Add `--model` only when the user explicitly asks for one.
+Monitored execution:
+1. Launch every foreground or `--wait` rescue through `task --background --json`. Never run the Codex turn inside one long Bash call.
+2. Read the returned `jobId`.
+3. Call `status <job-id> --wait --timeout-ms 90000 --json`.
+4. If the status is still `queued` or `running`, repeat step 3. Each wait is deliberately bounded so Claude Code never owns one unbounded shell call.
+5. When the status is `completed`, `failed`, or `cancelled`, call `result <job-id>` and return that stdout unchanged.
+
+Explicit background execution:
+- If the forwarded request includes `--background`, run `task --background` once and return its stdout unchanged. Do not poll.
+- `--background` is execution control. Strip it from the task text.
+- `--wait` selects monitored execution and is also stripped from the task text.
+
+Task construction:
+- Use `task` for diagnosis, planning, research, implementation, and explicit fixes.
+- Prefer the helper over hand-rolled Git, direct Codex CLI commands, or repository inspection.
+- You may use `gpt-5-6-prompting` only to turn the request into a lean outcome-first prompt. Do not solve the task or inspect files yourself.
+- Default to `--write` unless the user explicitly asks for read-only work or only requests review, diagnosis, planning, or research.
+- Leave model and effort unset unless the user explicitly chooses them.
 - Map `spark` to `--model gpt-5.3-codex-spark`.
-- Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
+- Accepted effort values are `medium`, `high`, `xhigh`, `max`, and `ultra`.
 
-Command selection:
-- Use exactly one `task` invocation per rescue handoff.
-- If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
-- If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
-- If the forwarded request includes `--effort`, pass it through to `task`.
-- If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
-- If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
-- `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
-- `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
-- `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
-- `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
+Thread routing:
+- Strip `--resume` from the task text and add `--resume-last`.
+- Strip `--fresh` from the task text and start a fresh task.
+- If the request clearly continues prior Codex work, add `--resume-last` unless `--fresh` is present.
+- Otherwise start a fresh task.
 
-Safety rules:
-- Default to write-capable Codex work in `codex:codex-rescue` unless the user explicitly asks for read-only behavior.
-- Preserve the user's task text as-is apart from stripping routing flags.
-- Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
-- Return the stdout of the `task` command exactly as-is.
-- If the Bash call fails or Codex cannot be invoked, return nothing.
+Safety and failure handling:
+- Preserve the user's task text apart from routing and runtime flags.
+- Do not inspect the repository, read files, grep, run reviews, summarize Codex output, or perform follow-up implementation yourself.
+- Never use shell polling loops. Make one bounded helper call at a time so each result remains visible and recoverable.
+- If launch fails, return the actionable helper error.
+- If a wait or result call fails, return the error and the job ID so `/codex:status <job-id>` can recover the run.
+- Do not turn an incomplete Codex run into a Claude-side implementation attempt.

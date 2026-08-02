@@ -13,7 +13,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
+import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -21,6 +21,8 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
+export const REQUEST_TIMEOUT_ENV = "CODEX_COMPANION_APP_SERVER_REQUEST_TIMEOUT_MS";
+const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -52,6 +54,11 @@ function createProtocolError(message, data) {
     error.rpcCode = data.code;
   }
   return error;
+}
+function resolveRequestTimeoutMs(options = {}) {
+  const raw = options.requestTimeoutMs ?? options.env?.[REQUEST_TIMEOUT_ENV] ?? process.env[REQUEST_TIMEOUT_ENV];
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_REQUEST_TIMEOUT_MS;
 }
 
 class AppServerClientBase {
@@ -92,8 +99,22 @@ class AppServerClientBase {
     this.nextId += 1;
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
-      this.sendMessage({ id, method, params });
+      const timeoutMs = resolveRequestTimeoutMs(this.options);
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) {
+          return;
+        }
+        reject(new Error(`Timed out after ${timeoutMs}ms waiting for codex app-server ${method}.`));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, { resolve, reject, method, timer });
+      try {
+        this.sendMessage({ id, method, params });
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 
@@ -139,6 +160,7 @@ class AppServerClientBase {
         return;
       }
       this.pending.delete(message.id);
+      clearTimeout(pending.timer);
 
       if (message.error) {
         pending.reject(createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error));
@@ -169,6 +191,7 @@ class AppServerClientBase {
     this.exitError = error ?? null;
 
     for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
       pending.reject(this.exitError ?? new Error("codex app-server connection closed."));
     }
     this.pending.clear();
@@ -283,18 +306,37 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
+    const timeoutMs = resolveRequestTimeoutMs(this.options);
     await new Promise((resolve, reject) => {
       const target = parseBrokerEndpoint(this.endpoint);
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        this.socket?.destroy();
+        reject(new Error(`Timed out after ${timeoutMs}ms connecting to the Codex app-server broker.`));
+      }, timeoutMs);
+      timer.unref?.();
+
+      const settle = (callback, value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        callback(value);
+      };
+
       this.socket = net.createConnection({ path: target.path });
       this.socket.setEncoding("utf8");
-      this.socket.on("connect", resolve);
+      this.socket.on("connect", () => settle(resolve));
       this.socket.on("data", (chunk) => {
         this.handleChunk(chunk);
       });
       this.socket.on("error", (error) => {
-        if (!this.exitResolved) {
-          reject(error);
-        }
+        settle(reject, error);
         this.handleExit(error);
       });
       this.socket.on("close", () => {
@@ -335,20 +377,30 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
 export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
     let brokerEndpoint = null;
+    const explicitBrokerEndpoint =
+      options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
     if (!options.disableBroker) {
-      brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
+      brokerEndpoint = explicitBrokerEndpoint;
       if (!brokerEndpoint && options.reuseExistingBroker) {
         brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
       }
-      if (!brokerEndpoint && !options.reuseExistingBroker) {
-        const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
-        brokerEndpoint = brokerSession?.endpoint ?? null;
-      }
     }
-    const client = brokerEndpoint
+
+    let client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
-    return client;
+    try {
+      await client.initialize();
+      return client;
+    } catch (error) {
+      await client.close().catch(() => {});
+      if (!brokerEndpoint || explicitBrokerEndpoint || !options.reuseExistingBroker) {
+        throw error;
+      }
+
+      client = new SpawnedCodexAppServerClient(cwd, options);
+      await client.initialize();
+      return client;
+    }
   }
 }

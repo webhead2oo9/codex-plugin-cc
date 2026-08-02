@@ -1,9 +1,8 @@
-# Codex plugin for Claude Code
+# Hardened Codex plugin for Claude Code
 
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
 
-This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
-they already have.
+This fork keeps OpenAI's command surface while making rescue work recoverable: monitored background jobs, isolated app-server processes, bounded waits, dead-worker reconciliation, and atomic state updates.
 
 <video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
 
@@ -11,7 +10,8 @@ they already have.
 
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/codex:rescue` for a recoverable background job that is monitored by default
+- `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` for handoff and job management
 
 ## Requirements
 
@@ -24,13 +24,13 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add webhead2oo9/codex-plugin-cc
 ```
 
 Install the plugin:
 
 ```bash
-/plugin install codex@openai-codex
+/plugin install codex@webhead2oo9-codex
 ```
 
 Reload plugins:
@@ -134,10 +134,14 @@ Use it when you want Codex to:
 - continue a previous Codex task
 - take a faster or cheaper pass with a smaller model
 
-> [!NOTE]
-> Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
+Every rescue runs as a recoverable background job inside the companion runtime. By default, the subagent waits through bounded 90-second status calls and returns the final result. A Claude Code Bash timeout therefore cannot orphan the Codex turn.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, and `--fresh`:
+
+- no execution flag: launch a recoverable job and monitor it to completion
+- `--wait`: the same explicit monitored behavior
+- `--background`: return the job ID immediately for manual `/codex:status` and `/codex:result` use
+- `--resume` / `--fresh`: continue the current Codex thread or start a new one
 
 Examples:
 
@@ -145,12 +149,12 @@ Examples:
 /codex:rescue investigate why the tests started failing
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
-/codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
+/codex:rescue --model gpt-5.6-sol --effort medium investigate the flaky integration test
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
 ```
 
-You can also just ask for a task to be delegated to Codex:
+You can also ask for delegation directly:
 
 ```text
 Ask Codex to redesign the database connection to be more resilient.
@@ -158,9 +162,12 @@ Ask Codex to redesign the database connection to be more resilient.
 
 **Notes:**
 
-- if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
+- if you do not pass `--model` or `--effort`, Codex chooses its own defaults
+- `--effort` accepts `medium`, `high`, `xhigh`, `max`, and `ultra`
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
+- a task with no app-server activity for 15 minutes fails instead of hanging forever; total runtime is capped at 90 minutes
+- override those guards with `CODEX_COMPANION_TASK_IDLE_TIMEOUT_MS` and `CODEX_COMPANION_TASK_MAX_RUNTIME_MS`
 
 ### `/codex:transfer`
 
@@ -266,24 +273,28 @@ Then check in with:
 
 ## Codex Integration
 
-The Codex plugin wraps the [Codex app server](https://developers.openai.com/codex/app-server). It uses the global `codex` binary installed in your environment and [applies the same configuration](https://developers.openai.com/codex/config-basic).
+The plugin wraps the [Codex app server](https://developers.openai.com/codex/app-server), using the global `codex` binary and [the same configuration](https://developers.openai.com/codex/config-basic).
+
+Each command starts an isolated app-server process by default. This avoids cross-session broker shutdowns, stale shared sockets, and leaked broker trees. An explicitly configured `CODEX_COMPANION_APP_SERVER_ENDPOINT` remains supported for advanced use.
+
+Job metadata uses locked, atomic updates. Status calls reconcile a `queued` or `running` job whose worker PID has exited into a terminal failure, preserving its job ID and log for recovery.
 
 ### Common Configurations
 
-If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.4-mini` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
+To choose a default model or reasoning effort, set it in user- or project-level `config.toml`. For example:
 
 ```toml
-model = "gpt-5.4-mini"
-model_reasoning_effort = "high"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "medium"
 ```
 
-Your configuration will be picked up based on:
+Your configuration is loaded from:
 
 - user-level config in `~/.codex/config.toml`
 - project-level overrides in `.codex/config.toml`
-- project-level overrides only load when the [project is trusted](https://developers.openai.com/codex/config-advanced#project-config-files-codexconfigtoml)
+- project-level overrides only when the [project is trusted](https://developers.openai.com/codex/config-advanced#project-config-files-codexconfigtoml)
 
-Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
+See the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
 
 ### Moving The Work Over To Codex
 
@@ -301,13 +312,13 @@ If you only use Claude Code today and have not used Codex yet, you will also nee
 
 ### Does the plugin use a separate Codex runtime?
 
-No. This plugin delegates through your local [Codex CLI](https://developers.openai.com/codex/cli/) and [Codex app server](https://developers.openai.com/codex/app-server/) on the same machine.
+Each command uses its own app-server process for isolation, but it still delegates through the local [Codex CLI](https://developers.openai.com/codex/cli/) on the same machine.
 
 That means:
 
-- it uses the same Codex install you would use directly
-- it uses the same local authentication state
+- it uses the same Codex installation and authentication state
 - it uses the same repository checkout and machine-local environment
+- one Claude session cannot shut down another session's active app-server process
 
 ### Will it use the same Codex config I already have?
 

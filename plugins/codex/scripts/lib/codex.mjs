@@ -50,6 +50,67 @@ const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
+export const TASK_MAX_RUNTIME_ENV = "CODEX_COMPANION_TASK_MAX_RUNTIME_MS";
+export const TASK_IDLE_TIMEOUT_ENV = "CODEX_COMPANION_TASK_IDLE_TIMEOUT_MS";
+const DEFAULT_TASK_MAX_RUNTIME_MS = 90 * 60 * 1000;
+const DEFAULT_TASK_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+
+function resolvePositiveDuration(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function createTurnWatchdog(state, options = {}) {
+  const maxRuntimeMs = resolvePositiveDuration(
+    options.maxRuntimeMs ?? process.env[TASK_MAX_RUNTIME_ENV],
+    DEFAULT_TASK_MAX_RUNTIME_MS
+  );
+  const idleTimeoutMs = resolvePositiveDuration(
+    options.idleTimeoutMs ?? process.env[TASK_IDLE_TIMEOUT_ENV],
+    DEFAULT_TASK_IDLE_TIMEOUT_MS
+  );
+  let runtimeTimer = null;
+  let idleTimer = null;
+
+  const fail = (message) => {
+    if (state.completed) {
+      return;
+    }
+    clearCompletionTimer(state);
+    state.completed = true;
+    const error = new Error(message);
+    state.error = error;
+    emitProgress(state.onProgress, message, "failed");
+    state.rejectCompletion(error);
+  };
+
+  const touch = () => {
+    if (state.completed) {
+      return;
+    }
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(
+      () => fail(`Codex task produced no app-server activity for ${idleTimeoutMs}ms and was stopped.`),
+      idleTimeoutMs
+    );
+    idleTimer.unref?.();
+  };
+
+  runtimeTimer = setTimeout(
+    () => fail(`Codex task exceeded the ${maxRuntimeMs}ms maximum runtime and was stopped.`),
+    maxRuntimeMs
+  );
+  runtimeTimer.unref?.();
+  touch();
+
+  return {
+    touch,
+    clear() {
+      clearTimeout(runtimeTimer);
+      clearTimeout(idleTimer);
+    }
+  };
+}
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -559,8 +620,10 @@ function applyTurnNotification(state, message) {
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+  const watchdog = createTurnWatchdog(state, options);
 
   client.setNotificationHandler((message) => {
+    watchdog.touch();
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
       return;
@@ -572,10 +635,10 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     if (!belongsToTurn(state, message)) {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-        return;
+      if (previousHandler) {
+        previousHandler(message);
+      }
+      return;
     }
 
     applyTurnNotification(state, message);
@@ -583,6 +646,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 
   try {
     const response = await startRequest();
+    watchdog.touch();
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
@@ -591,10 +655,8 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     for (const message of state.bufferedNotifications) {
       if (belongsToTurn(state, message)) {
         applyTurnNotification(state, message);
-      } else {
-        if (previousHandler) {
-          previousHandler(message);
-        }
+      } else if (previousHandler) {
+        previousHandler(message);
       }
     }
     state.bufferedNotifications.length = 0;
@@ -605,6 +667,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 
     return await state.completion;
   } finally {
+    watchdog.clear();
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
@@ -916,8 +979,8 @@ export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) 
 
   return {
     mode: "direct",
-    label: "direct startup",
-    detail: "No shared Codex runtime is active yet. The first review or task command will start one on demand.",
+    label: "isolated runtime",
+    detail: "Each Codex command uses an isolated app-server process unless an explicit broker endpoint is configured.",
     endpoint: null
   };
 }
@@ -1030,12 +1093,13 @@ export async function runAppServerReview(cwd, options = {}) {
         }),
       {
         onProgress: options.onProgress,
-        onResponse(response, state) {
-          if (response.reviewThreadId) {
-            state.threadIds.add(response.reviewThreadId);
-            if (delivery === "detached") {
-              state.threadId = response.reviewThreadId;
-            }
+        maxRuntimeMs: options.maxRuntimeMs,
+        idleTimeoutMs: options.idleTimeoutMs,
+        onResponse: (response, state) => {
+          const responseThreadId = response.reviewThreadId ?? sourceThreadId;
+          if (responseThreadId !== sourceThreadId) {
+            registerThread(state, responseThreadId);
+            state.threadId = responseThreadId;
           }
         }
       }
@@ -1140,7 +1204,11 @@ export async function runAppServerTurn(cwd, options = {}) {
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      {
+        onProgress: options.onProgress,
+        maxRuntimeMs: options.maxRuntimeMs,
+        idleTimeoutMs: options.idleTimeoutMs
+      }
     );
 
     return {

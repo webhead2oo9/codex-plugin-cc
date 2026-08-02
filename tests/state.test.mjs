@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -6,6 +7,64 @@ import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
 import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+const STATE_MODULE_URL = new URL("../plugins/codex/scripts/lib/state.mjs", import.meta.url).href;
+
+function runStateWriter(workspace, prefix, count) {
+  const script = `
+    const [workspace, prefix, count] = process.argv.slice(1);
+    const { upsertJob } = await import(${JSON.stringify(STATE_MODULE_URL)});
+    for (let index = 0; index < Number(count); index += 1) {
+      upsertJob(workspace, {
+        id: prefix + "-" + index,
+        status: "completed",
+        createdAt: new Date().toISOString()
+      });
+    }
+  `;
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script, workspace, prefix, String(count)], {
+      stdio: ["ignore", "ignore", "pipe"]
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`state writer exited ${code}: ${stderr}`));
+    });
+  });
+}
+
+
+test("saveState recovers a lock left by an exited process", async () => {
+  const workspace = makeTempDir();
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", resolve);
+  });
+
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const lockFile = path.join(stateDir, "state.lock");
+  fs.writeFileSync(lockFile, `${child.pid} ${Date.now()}\n`, "utf8");
+
+  saveState(workspace, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: []
+  });
+
+  assert.equal(fs.existsSync(lockFile), false);
+  assert.equal(fs.existsSync(resolveStateFile(workspace)), true);
+});
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +161,26 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("concurrent state writers preserve every job and valid JSON", async () => {
+  const workspace = makeTempDir();
+  const writerCount = 6;
+  const jobsPerWriter = 5;
+
+  await Promise.all(
+    Array.from({ length: writerCount }, (_, index) => runStateWriter(workspace, `writer-${index}`, jobsPerWriter))
+  );
+
+  const stateFile = resolveStateFile(workspace);
+  const savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  const actualIds = savedState.jobs.map((job) => job.id).sort();
+  const expectedIds = Array.from({ length: writerCount }, (_, writerIndex) =>
+    Array.from({ length: jobsPerWriter }, (_, jobIndex) => `writer-${writerIndex}-${jobIndex}`)
+  )
+    .flat()
+    .sort();
+
+  assert.deepEqual(actualIds, expectedIds);
+  assert.equal(fs.existsSync(path.join(resolveStateDir(workspace), "state.lock")), false);
 });
